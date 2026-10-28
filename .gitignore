@@ -1,0 +1,28 @@
+# Environment files (may contain credentials)
+.env
+.env.*
+
+# Token files
+*.token
+
+# Pull secret files (contain credentials)
+*pull-secret*
+.dockerconfigjson
+
+# Cloud keys
+*.pem
+*.json
+!package.json
+!package-lock.json
+
+# Log files
+*.log
+
+# Temporary files
+/tmp/
+
+# Editor files
+*.swp
+*.swo
+*~
+.DS_Store
