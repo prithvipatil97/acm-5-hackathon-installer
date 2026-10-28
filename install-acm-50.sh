@@ -17,7 +17,7 @@ set -euo pipefail
 # Compatible with: OCP 5.0
 ########################################################################
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly SUPPORTED_OCP_VERSIONS="5.0"
 
 readonly ACM_CATALOG_PINNED="quay.io/redhat-user-workloads/ocp-art-tenant/art-fbc@sha256:31ad04c6ed1022944edec50584728b8d03d2828d170d685f79bbf454c307174e"
@@ -83,7 +83,8 @@ Options:
   --email EMAIL            Red Hat email prefix (e.g. pripatil)
   --token TOKEN            Base64-encoded stage registry token
                            (or set STAGE_REGISTRY_TOKEN). Never logged.
-  --timeout MINUTES        MCP wait timeout (default: 30)
+  --timeout MINUTES        Wait timeout for MCP, MultiClusterHub, and MCO (default: 30).
+                           The script stays running until success or this timeout.
   --latest                 Use floating ACM/MCE FBC tags instead of Testathon pins
   --skip-observability     Install hub only; do not deploy MultiClusterObservability
   --dry-run                Show what would be done without executing
@@ -118,7 +119,10 @@ parse_args() {
             --token)
                 STAGE_REGISTRY_TOKEN="$2"; shift 2 ;;
             --timeout)
-                MCP_TIMEOUT="$2"; shift 2 ;;
+                MCP_TIMEOUT="$2"
+                MCH_TIMEOUT="$2"
+                MCO_TIMEOUT="$2"
+                shift 2 ;;
             --latest)
                 USE_LATEST=true; shift ;;
             --skip-observability)
@@ -577,7 +581,7 @@ wait_for_csv_prefix() {
     local timeout_sec="$3"
     local start_time elapsed phase
     start_time=$(date +%s)
-    info "Waiting for CSV ${prefix}* in ${ns}..."
+    info "Waiting for CSV ${prefix}* in ${ns} (timeout $((timeout_sec / 60))m). Script stays running."
     while true; do
         phase=$(csv_phase "$ns" "$prefix")
         if [[ "$phase" == "Succeeded" ]]; then
@@ -592,7 +596,10 @@ wait_for_csv_prefix() {
         if [[ $elapsed -ge $timeout_sec ]]; then
             error "Timed out waiting for CSV ${prefix}* in ${ns} (last phase: ${phase:-none})"
         fi
-        printf "\r  Phase: %-16s (%ds)  " "${phase:-Pending}" "$elapsed"
+        printf "\r  Phase: %-16s (%ds elapsed, still installing)  " "${phase:-Pending}" "$elapsed"
+        if (( elapsed > 0 && elapsed % 60 < 16 )); then
+            info "Still waiting for CSV ${prefix}* (phase=${phase:-Pending}, ${elapsed}s elapsed)"
+        fi
         sleep 15
     done
 }
@@ -685,7 +692,7 @@ step_wait_hub() {
     local timeout_sec=$((MCH_TIMEOUT * 60))
     local start_time elapsed phase
     start_time=$(date +%s)
-    info "Waiting for MultiClusterHub phase=Running (timeout ${MCH_TIMEOUT}m)..."
+    info "Waiting for MultiClusterHub phase=Running (timeout ${MCH_TIMEOUT}m). Script stays running; this often takes 10–20 minutes."
     while true; do
         phase=$(oc get mch multiclusterhub -n "$ACM_NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Pending")
         if [[ "$phase" == "Running" ]]; then
@@ -697,9 +704,31 @@ step_wait_hub() {
         if [[ $elapsed -ge $timeout_sec ]]; then
             error "Timed out waiting for MultiClusterHub Running (last phase: ${phase}). Check: oc get mch -n ${ACM_NS}; oc get sub -n ${MCE_NS}"
         fi
-        printf "\r  MCH phase: %-16s (%dm elapsed)  " "$phase" $((elapsed / 60))
+        printf "\r  MCH phase: %-16s (%dm elapsed, still installing)  " "$phase" $((elapsed / 60))
+        if (( elapsed > 0 && elapsed % 60 < 25 )); then
+            info "Still waiting for MultiClusterHub Running (phase=${phase}, ${elapsed}s elapsed)"
+        fi
         sleep 20
     done
+
+    info "Waiting for local-cluster to become Available..."
+    local mc_start mc_elapsed avail
+    mc_start=$(date +%s)
+    while true; do
+        avail=$(oc get managedcluster local-cluster -o jsonpath='{.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status}' 2>/dev/null || true)
+        if [[ "$avail" == "True" ]]; then
+            success "ManagedCluster local-cluster is Available"
+            break
+        fi
+        mc_elapsed=$(( $(date +%s) - mc_start ))
+        if [[ $mc_elapsed -ge 600 ]]; then
+            warn "local-cluster not Available after 10m (hub is Running; import may still finish). Check: oc get managedcluster"
+            break
+        fi
+        printf "\r  local-cluster Available=%-6s (%ds)  " "${avail:-False}" "$mc_elapsed"
+        sleep 15
+    done
+    echo ""
 
     wait_for_csv_prefix "$MCE_NS" "multicluster-engine.v5" 600
 
@@ -892,7 +921,7 @@ EOF
 
     local timeout_sec=$((MCO_TIMEOUT * 60)) start_time elapsed ready
     start_time=$(date +%s)
-    info "Waiting for MultiClusterObservability Ready (timeout ${MCO_TIMEOUT}m)..."
+    info "Waiting for MultiClusterObservability Ready (timeout ${MCO_TIMEOUT}m). Script stays running."
     while true; do
         ready=$(oc get mco observability -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
         if [[ "$ready" == "True" ]]; then
@@ -902,10 +931,12 @@ EOF
         fi
         elapsed=$(( $(date +%s) - start_time ))
         if [[ $elapsed -ge $timeout_sec ]]; then
-            warn "MCO not Ready after ${MCO_TIMEOUT}m (install may still be progressing). Check: oc get mco observability"
-            return 0
+            error "MultiClusterObservability not Ready after ${MCO_TIMEOUT}m. Check: oc get mco observability; oc get pods -n ${OBS_NS}"
         fi
-        printf "\r  Ready=%-6s (%dm elapsed)  " "${ready:-False}" $((elapsed / 60))
+        printf "\r  Ready=%-6s (%dm elapsed, still installing)  " "${ready:-False}" $((elapsed / 60))
+        if (( elapsed > 0 && elapsed % 60 < 25 )); then
+            info "Still waiting for MultiClusterObservability Ready (${elapsed}s elapsed)"
+        fi
         sleep 20
     done
 }
@@ -968,42 +999,90 @@ wait_deleted() {
     done
 }
 
+wait_ns_gone() {
+    local ns="$1"
+    local timeout="${2:-600}"
+    oc get ns "$ns" &>/dev/null || return 0
+    info "Waiting for namespace ${ns} to terminate..."
+    if oc wait ns "$ns" --for=delete --timeout="${timeout}s" &>/dev/null; then
+        success "Namespace ${ns} deleted"
+        return 0
+    fi
+    warn "Namespace ${ns} still terminating after ${timeout}s"
+}
+
+delete_acm_crds() {
+    info "Deleting leftover ACM/MCE CRDs (not Logging/Loki/COO)"
+    local crd group
+    while read -r crd; do
+        [[ -z "$crd" ]] && continue
+        group=${crd#*.}
+        case "$group" in
+            *open-cluster-management.io|hive.openshift.io|hiveinternal.openshift.io|agent-install.openshift.io|extensions.hive.openshift.io|multicluster.openshift.io|hypershift.openshift.io)
+                info "  deleting CRD ${crd}"
+                oc delete crd "$crd" --ignore-not-found --wait=false || true
+                ;;
+        esac
+    done < <(oc get crd -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+}
+
 do_uninstall() {
-    step "1" "Uninstalling ACM 5 resources created by this script"
+    step "1" "Uninstalling ACM 5 (script stays running until teardown finishes)"
     warn "Logging, Loki, COO, clo-stage, lo-stage, and logging-stage IDMS will NOT be removed."
     warn "Cluster pull-secret will NOT be reverted."
 
     if oc get mco observability &>/dev/null; then
-        info "Deleting MultiClusterObservability"
-        oc delete mco observability --ignore-not-found --wait=false
-        wait_deleted mco observability "" 600
+        info "Deleting MultiClusterObservability (can take several minutes)"
+        oc delete mco observability --ignore-not-found --wait=false || true
+        wait_deleted mco observability "" 900
     fi
 
     if oc get mch multiclusterhub -n "$ACM_NS" &>/dev/null; then
-        info "Deleting MultiClusterHub (this can take several minutes)"
-        oc delete mch multiclusterhub -n "$ACM_NS" --ignore-not-found --wait=false
-        wait_deleted mch multiclusterhub "$ACM_NS" 900
+        info "Deleting MultiClusterHub (often 5–15 minutes). Script stays running."
+        oc delete mch multiclusterhub -n "$ACM_NS" --ignore-not-found --wait=false || true
+        wait_deleted mch multiclusterhub "$ACM_NS" 1200
+    fi
+
+    if oc get mce --no-headers 2>/dev/null | grep -q .; then
+        info "Deleting MultiClusterEngine"
+        oc delete mce --all --ignore-not-found --wait=false || true
+        local mce_name
+        mce_name=$(oc get mce -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+        if [[ -n "$mce_name" ]]; then
+            wait_deleted mce "$mce_name" "" 900
+        fi
     fi
 
     info "Deleting ACM/MCE subscriptions and CSVs"
     oc delete sub advanced-cluster-management -n "$ACM_NS" --ignore-not-found || true
     oc delete sub multicluster-engine -n "$MCE_NS" --ignore-not-found || true
-    oc delete csv -n "$ACM_NS" -l operators.coreos.com/advanced-cluster-management.open-cluster-management --ignore-not-found || true
-    oc delete csv -n "$MCE_NS" -l operators.coreos.com/multicluster-engine.multicluster-engine --ignore-not-found || true
+    oc get csv -n "$ACM_NS" -o name 2>/dev/null | grep advanced-cluster-management | xargs -r oc delete -n "$ACM_NS" --ignore-not-found || true
+    oc get csv -n "$MCE_NS" -o name 2>/dev/null | grep multicluster-engine | xargs -r oc delete -n "$MCE_NS" --ignore-not-found || true
 
     info "Deleting OperatorGroups"
-    oc delete operatorgroup acm-operatorgroup -n "$ACM_NS" --ignore-not-found || true
+    oc delete operatorgroup --all -n "$ACM_NS" --ignore-not-found || true
     oc delete operatorgroup --all -n "$MCE_NS" --ignore-not-found || true
 
-    info "Deleting ACM/MCE namespaces"
-    oc delete ns "$OBS_NS" --ignore-not-found --wait=false || true
-    oc delete ns "$ACM_NS" --ignore-not-found --wait=false || true
-    oc delete ns "$MCE_NS" --ignore-not-found --wait=false || true
-    oc delete ns open-cluster-management-hub --ignore-not-found --wait=false || true
-    oc delete ns open-cluster-management-agent --ignore-not-found --wait=false || true
-    oc delete ns open-cluster-management-agent-addon --ignore-not-found --wait=false || true
+    info "Deleting ACM/MCE namespaces (not openshift-logging)"
+    local ns
+    for ns in "$OBS_NS" "$ACM_NS" "$MCE_NS" \
+              open-cluster-management-hub \
+              open-cluster-management-agent \
+              open-cluster-management-agent-addon \
+              local-cluster hive; do
+        oc delete ns "$ns" --ignore-not-found --wait=false || true
+    done
+    for ns in "$OBS_NS" "$ACM_NS" "$MCE_NS" \
+              open-cluster-management-hub \
+              open-cluster-management-agent \
+              open-cluster-management-agent-addon \
+              local-cluster hive; do
+        wait_ns_gone "$ns" 600
+    done
 
-    info "Deleting ACM/MCE CatalogSources only"
+    delete_acm_crds
+
+    info "Deleting ACM/MCE CatalogSources only (not clo-stage/lo-stage)"
     oc delete catalogsource "$ACM_CATALOG_NAME" -n openshift-marketplace --ignore-not-found || true
     oc delete catalogsource "$MCE_CATALOG_NAME" -n openshift-marketplace --ignore-not-found || true
 
@@ -1014,7 +1093,14 @@ do_uninstall() {
         warn "--delete-bucket requested, but bucket name is not stored in this script. Delete the acm-observe-* bucket from the cloud console if needed."
     fi
 
-    success "Uninstall complete. Pull-secret, Logging, Loki, and COO were left in place."
+    echo ""
+    info "=== Post-uninstall check ==="
+    oc get mch -A 2>/dev/null || true
+    oc get mce -A 2>/dev/null || true
+    oc get mco 2>/dev/null || true
+    oc get ns | grep -E 'open-cluster-management|multicluster-engine' || info "No ACM/MCE namespaces remain"
+    echo ""
+    success "Uninstall finished. Pull-secret, Logging, Loki, and COO were left in place."
 }
 
 main() {

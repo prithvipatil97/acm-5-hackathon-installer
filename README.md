@@ -56,13 +56,22 @@ You can also use `STAGE_REGISTRY_TOKEN` or `--token` on your machine only.
 
 ```bash
 ./install-acm-50.sh --email pripatil
+./install-acm-50.sh --email pripatil --timeout 45
 ./install-acm-50.sh --email pripatil --dry-run
 ./install-acm-50.sh --email pripatil --latest
 ./install-acm-50.sh --email pripatil --skip-observability
 ./install-acm-50.sh --uninstall
 ```
 
-`--uninstall` removes ACM/MCE/MCO, `acm-art`, `mce-art`, and IDMS `acm-stage` only. It does **not** remove Logging, Loki, COO, `logging-stage`, or the cluster pull-secret.
+The installer **does not exit after applying YAML**. It stays running and polls until MultiClusterHub is `Running` (default timeout 30 minutes; ACM install often takes 10–20 minutes). CSV, webhook, MCE 5.0, and MultiClusterObservability Ready are also waited on. Use `--timeout 45` if you want a longer wait. If a wait times out, the script exits with an error.
+
+After testing, uninstall **everything this script installed** (not Logging/Loki/COO):
+
+```bash
+./install-acm-50.sh --uninstall
+```
+
+That deletes MCO → MultiClusterHub → MCE → ACM/MCE operators, namespaces, leftover ACM/MCE CRDs, `acm-art`/`mce-art`, and IDMS `acm-stage`. It does **not** remove Logging, Loki, COO, `logging-stage`, or the cluster pull-secret. Uninstall also stays running until those deletes finish (MCH removal can take 5–15 minutes).
 
 ## What it does
 
