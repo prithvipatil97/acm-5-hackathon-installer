@@ -1,6 +1,6 @@
 # ACM 5.0 Hackathon Installer
 
-Automated installer for **ACM 5.0** with bundled **MCE 5.0** (ART FBC staging catalogs) on **OCP 5.0**, then MultiClusterObservability.
+Automated installer for **ACM 5.0** with bundled **MCE 5.0** (ART FBC staging catalogs) on **OCP 5.0**. Hub only — it does **not** install MultiClusterObservability.
 
 This folder is standalone. Do **not** add it to `logging-hackathon-installer`. Logging and ACM stay in separate directories.
 
@@ -12,7 +12,6 @@ This folder is standalone. Do **not** add it to `logging-hackathon-installer`. L
 - **`oc` CLI**: already logged in with cluster-admin (`oc login` is not stored here)
 - **`jq`** and **`python3`**
 - **Stage registry token** (only if pull-secret lacks stage auth): from the **internal hackathon email / Slack**, not from git
-- **Observability** (default on): AWS (`~/.aws/credentials`) or GCP (`~/.gcp/*.json`) on your laptop
 
 ## Catalog images (public ART FBC, not secrets)
 
@@ -34,12 +33,6 @@ chmod +x install-acm-50.sh
 ./install-acm-50.sh --email <your-kerberos-id>
 ```
 
-Hub only (no MultiClusterObservability):
-
-```bash
-./install-acm-50.sh --email <your-kerberos-id> --skip-observability
-```
-
 ## Obtaining the registry token (never commit it)
 
 Credentials come from the **internal** ACM 5 hackathon email or `#acm-5-hackathon`, not from this folder.
@@ -59,11 +52,10 @@ You can also use `STAGE_REGISTRY_TOKEN` or `--token` on your machine only.
 ./install-acm-50.sh --email pripatil --timeout 45
 ./install-acm-50.sh --email pripatil --dry-run
 ./install-acm-50.sh --email pripatil --latest
-./install-acm-50.sh --email pripatil --skip-observability
 ./install-acm-50.sh --uninstall
 ```
 
-The installer **does not exit after applying YAML**. It stays running and polls until MultiClusterHub is `Running` (default timeout 30 minutes; ACM install often takes 10–20 minutes). CSV, webhook, MCE 5.0, and MultiClusterObservability Ready are also waited on. Use `--timeout 45` if you want a longer wait. If a wait times out, the script exits with an error.
+The installer **does not exit after applying YAML**. It stays running and polls until MultiClusterHub is `Running` (default timeout 30 minutes; ACM install often takes 10–20 minutes). CSV, webhook, and MCE 5.0 are also waited on. Use `--timeout 45` if you want a longer wait. If a wait times out, the script exits with an error.
 
 After testing, uninstall **everything this script installed** (not Logging/Loki/COO):
 
@@ -71,7 +63,7 @@ After testing, uninstall **everything this script installed** (not Logging/Loki/
 ./install-acm-50.sh --uninstall
 ```
 
-That deletes MCO → MultiClusterHub → MCE → ACM/MCE operators, namespaces, leftover ACM/MCE CRDs, `acm-art`/`mce-art`, and IDMS `acm-stage`. It does **not** remove Logging, Loki, COO, `logging-stage`, or the cluster pull-secret. Uninstall also stays running until those deletes finish (MCH removal can take 5–15 minutes).
+That deletes MultiClusterHub → MCE → ACM/MCE operators, namespaces, leftover ACM/MCE CRDs, `acm-art`/`mce-art`, and IDMS `acm-stage`. If a leftover MultiClusterObservability exists, it is removed first. It does **not** remove Logging, Loki, COO, `logging-stage`, or the cluster pull-secret. Uninstall also stays running until those deletes finish (MCH removal can take 5–15 minutes).
 
 ## What it does
 
@@ -86,8 +78,7 @@ That deletes MCO → MultiClusterHub → MCE → ACM/MCE operators, namespaces, 
 | 6 | Detect channels: ACM prefers `release-5.0`, MCE prefers `stable-5.0` |
 | 7–8 | ACM Subscription from `acm-art`; wait CSV `advanced-cluster-management.v5` |
 | 9–10 | MultiClusterHub with `mce-subscription-spec` pointing at `mce-art`; wait Running |
-| 11 | MultiClusterObservability (unless `--skip-observability`) |
-| 12 | Summary (no secret values printed) |
+| 11 | Summary (no secret values printed) |
 
 ## Security rules for sharing
 

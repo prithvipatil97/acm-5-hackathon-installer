@@ -3,21 +3,20 @@ set -euo pipefail
 
 ########################################################################
 # ACM 5.0 Hackathon Installer
-# Installs ACM 5.0 with bundled MCE 5.0 from ART FBC catalogs, then
-# MultiClusterObservability. Same shape as the logging 6.6/6.7 scripts.
+# Installs ACM 5.0 with bundled MCE 5.0 from ART FBC catalogs.
+# Same shape as the logging 6.6/6.7 scripts. Hub only (no observability).
 #
 # Security:
 #   - No registry tokens, kubeadmin passwords, or cloud keys in this file
 #   - Stage token only via --token, STAGE_REGISTRY_TOKEN, or silent prompt
 #   - Token is never written to the log file
 #   - Pull-secret temp files are mode 0600 and deleted on exit
-#   - Cloud credentials are read from local aws/gcloud config only
 #   - Requires an existing oc login (this script never stores cluster passwords)
 #
 # Compatible with: OCP 5.0
 ########################################################################
 
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
 readonly SUPPORTED_OCP_VERSIONS="5.0"
 
 readonly ACM_CATALOG_PINNED="quay.io/redhat-user-workloads/ocp-art-tenant/art-fbc@sha256:31ad04c6ed1022944edec50584728b8d03d2828d170d685f79bbf454c307174e"
@@ -37,11 +36,8 @@ EMAIL=""
 DRY_RUN=false
 UNINSTALL=false
 USE_LATEST=false
-SKIP_OBSERVABILITY=false
-DELETE_BUCKET=false
 MCP_TIMEOUT=30
 MCH_TIMEOUT=30
-MCO_TIMEOUT=30
 LOG_FILE=""
 ACM_CHANNEL=""
 MCE_CHANNEL=""
@@ -73,8 +69,8 @@ usage() {
     cat <<EOF
 ACM 5.0 Hackathon Installer v${SCRIPT_VERSION}
 
-Installs ACM 5.0 + bundled MCE 5.0 from ART FBC catalogs on OCP 5.0,
-then deploys MultiClusterObservability (AWS or GCP object storage).
+Installs ACM 5.0 + bundled MCE 5.0 from ART FBC catalogs on OCP 5.0.
+Does not install MultiClusterObservability.
 
 Usage:
   $(basename "$0") [OPTIONS]
@@ -83,13 +79,11 @@ Options:
   --email EMAIL            Red Hat email prefix (e.g. pripatil)
   --token TOKEN            Base64-encoded stage registry token
                            (or set STAGE_REGISTRY_TOKEN). Never logged.
-  --timeout MINUTES        Wait timeout for MCP, MultiClusterHub, and MCO (default: 30).
+  --timeout MINUTES        Wait timeout for MCP and MultiClusterHub (default: 30).
                            The script stays running until success or this timeout.
   --latest                 Use floating ACM/MCE FBC tags instead of Testathon pins
-  --skip-observability     Install hub only; do not deploy MultiClusterObservability
   --dry-run                Show what would be done without executing
   --uninstall              Remove ACM/MCE/MCO/catalogs/acm-stage IDMS only
-  --delete-bucket          With --uninstall, also delete the Thanos object-storage bucket
   -h, --help               Show this help
 
 Credentials:
@@ -99,12 +93,10 @@ Credentials:
     2. STAGE_REGISTRY_TOKEN environment variable
     3. Silent interactive prompt
   This script never hardcodes or logs that token.
-  Cluster login must already exist (oc login). Cloud keys come from
-  ~/.aws/credentials or ~/.gcp/*.json and are not printed.
+  Cluster login must already exist (oc login).
 
 Examples:
   $(basename "$0") --email pripatil
-  $(basename "$0") --email pripatil --skip-observability
   $(basename "$0") --email pripatil --latest --dry-run
   $(basename "$0") --uninstall
 EOF
@@ -121,18 +113,13 @@ parse_args() {
             --timeout)
                 MCP_TIMEOUT="$2"
                 MCH_TIMEOUT="$2"
-                MCO_TIMEOUT="$2"
                 shift 2 ;;
             --latest)
                 USE_LATEST=true; shift ;;
-            --skip-observability)
-                SKIP_OBSERVABILITY=true; shift ;;
             --dry-run)
                 DRY_RUN=true; shift ;;
             --uninstall)
                 UNINSTALL=true; shift ;;
-            --delete-bucket)
-                DELETE_BUCKET=true; shift ;;
             -h|--help)
                 usage ;;
             *)
@@ -742,210 +729,11 @@ step_wait_hub() {
     success "MCE CSV: ${mce_csv}"
 }
 
-default_storageclass() {
-    local sc
-    sc=$(oc get sc -o jsonpath='{.items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")].metadata.name}' 2>/dev/null | awk '{print $1}')
-    if [[ -z "$sc" ]]; then
-        sc="gp3-csi"
-        warn "No default StorageClass annotated; using ${sc}"
-    fi
-    echo "$sc"
-}
-
-setup_cloud_for_observability() {
-    PLATFORM=$(oc get infrastructure cluster -o jsonpath='{.status.platformStatus.type}' 2>/dev/null || true)
-    case "$PLATFORM" in
-        AWS)
-            need_cmd aws
-            [[ -f "${HOME}/.aws/credentials" ]] || error "AWS credentials file ~/.aws/credentials not found."
-            AWS_ACCESS_KEY_ID=$(aws configure get aws_access_key_id)
-            AWS_SECRET_ACCESS_KEY=$(aws configure get aws_secret_access_key)
-            if [[ -z "$AWS_ACCESS_KEY_ID" || -z "$AWS_SECRET_ACCESS_KEY" ]]; then
-                error "Could not read AWS keys via 'aws configure get' (values are not logged)."
-            fi
-            CLOUD_REGION=$(oc get infrastructure cluster -o jsonpath='{.status.platformStatus.aws.region}' 2>/dev/null)
-            CLOUD_REGION="${CLOUD_REGION:-us-west-2}"
-            success "AWS observability backend (region ${CLOUD_REGION}; keys not logged)"
-            ;;
-        GCP)
-            need_cmd gcloud
-            GCP_CREDS_FILE="${HOME}/.gcp/osServiceAccount.json"
-            if [[ ! -f "$GCP_CREDS_FILE" ]]; then
-                GCP_CREDS_FILE=$(ls "${HOME}/.gcp/"*.json 2>/dev/null | head -n 1 || true)
-            fi
-            [[ -n "$GCP_CREDS_FILE" && -f "$GCP_CREDS_FILE" ]] || error "GCP service-account JSON not found in ~/.gcp/"
-            gcloud auth activate-service-account --key-file="$GCP_CREDS_FILE" >/dev/null 2>&1 || true
-            CLOUD_REGION=$(oc get infrastructure cluster -o jsonpath='{.status.platformStatus.gcp.region}' 2>/dev/null)
-            CLOUD_REGION="${CLOUD_REGION:-us-east1}"
-            success "GCP observability backend (region ${CLOUD_REGION}; key file not printed)"
-            ;;
-        *)
-            error "Observability object storage supports AWS and GCP. Detected platform: ${PLATFORM:-unknown}. Use --skip-observability."
-            ;;
-    esac
-}
-
-create_thanos_bucket() {
-    local prefix="$1"
-    local suffix bucket
-    if command -v openssl &>/dev/null; then
-        suffix=$(openssl rand -hex 4)
-    else
-        suffix=$(date +%s | tail -c 9)
-    fi
-    bucket="${prefix}${suffix}"
-    case "$PLATFORM" in
-        AWS)
-            info "Creating S3 bucket ${bucket} in ${CLOUD_REGION}"
-            if [[ "$CLOUD_REGION" == "us-east-1" ]]; then
-                aws s3api create-bucket --bucket "$bucket" --region "$CLOUD_REGION" >/dev/null
-            else
-                aws s3api create-bucket --bucket "$bucket" --region "$CLOUD_REGION" \
-                    --create-bucket-configuration LocationConstraint="$CLOUD_REGION" >/dev/null
-            fi
-            ;;
-        GCP)
-            info "Creating GCS bucket ${bucket} in ${CLOUD_REGION}"
-            gcloud storage buckets create "gs://${bucket}" --location="$CLOUD_REGION" >/dev/null
-            ;;
-    esac
-    echo "$bucket"
-}
-
-apply_thanos_secret() {
-    local bucket="$1"
-    local tmp
-    tmp=$(mktemp /tmp/acm5-thanos-XXXXXX.yaml)
-    chmod 600 "$tmp"
-
-    case "$PLATFORM" in
-        AWS)
-            cat > "$tmp" <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: thanos-object-storage
-  namespace: ${OBS_NS}
-type: Opaque
-stringData:
-  thanos.yaml: |
-    type: s3
-    config:
-      bucket: ${bucket}
-      endpoint: s3.${CLOUD_REGION}.amazonaws.com
-      insecure: false
-      access_key: ${AWS_ACCESS_KEY_ID}
-      secret_key: ${AWS_SECRET_ACCESS_KEY}
-EOF
-            ;;
-        GCP)
-            python3 - "$tmp" "$GCP_CREDS_FILE" "$bucket" "$OBS_NS" <<'PY'
-import json, sys
-out, keyfile, bucket, ns = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-sa = json.load(open(keyfile))
-sa_block = json.dumps(sa, indent=2)
-indented = "\n".join(("      " + line) if line else "" for line in sa_block.splitlines())
-open(out, "w").write(f"""apiVersion: v1
-kind: Secret
-metadata:
-  name: thanos-object-storage
-  namespace: {ns}
-type: Opaque
-stringData:
-  thanos.yaml: |
-    type: GCS
-    config:
-      bucket: {bucket}
-      service_account: |-
-{indented}
-""")
-PY
-            chmod 600 "$tmp"
-            ;;
-    esac
-
-    oc apply -f "$tmp" >/dev/null
-    rm -f "$tmp"
-    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY || true
-}
-
-step_install_observability() {
-    step "11" "Installing MultiClusterObservability"
-
-    if [[ "$SKIP_OBSERVABILITY" == true ]]; then
-        info "Skipping observability (--skip-observability)"
-        return 0
-    fi
-
-    if [[ "$DRY_RUN" == true ]]; then
-        info "[DRY-RUN] Would create Thanos secret and MultiClusterObservability"
-        return 0
-    fi
-
-    if oc get mco observability &>/dev/null; then
-        success "MultiClusterObservability already exists (skipping)"
-        return 0
-    fi
-
-    setup_cloud_for_observability
-    oc create namespace "$OBS_NS" --dry-run=client -o yaml | oc apply -f - >/dev/null
-
-    local bucket=""
-    if oc get secret thanos-object-storage -n "$OBS_NS" &>/dev/null; then
-        success "thanos-object-storage secret already exists (reusing; not printing contents)"
-    else
-        local key
-        key=$(echo "${EMAIL:-acm5}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | head -c 12)
-        [[ -n "$key" ]] || key="acm5"
-        bucket=$(create_thanos_bucket "acm-observe-${key}-")
-        apply_thanos_secret "$bucket"
-        success "Created thanos-object-storage for bucket ${bucket}"
-    fi
-
-    local sc
-    sc=$(default_storageclass)
-    oc apply -f - <<EOF
-apiVersion: observability.open-cluster-management.io/v1beta2
-kind: MultiClusterObservability
-metadata:
-  name: observability
-spec:
-  observabilityAddonSpec: {}
-  storageConfig:
-    storageClass: ${sc}
-    metricObjectStorage:
-      name: thanos-object-storage
-      key: thanos.yaml
-EOF
-    success "MultiClusterObservability created (StorageClass ${sc})"
-
-    local timeout_sec=$((MCO_TIMEOUT * 60)) start_time elapsed ready
-    start_time=$(date +%s)
-    info "Waiting for MultiClusterObservability Ready (timeout ${MCO_TIMEOUT}m). Script stays running."
-    while true; do
-        ready=$(oc get mco observability -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
-        if [[ "$ready" == "True" ]]; then
-            echo ""
-            success "MultiClusterObservability is Ready"
-            return 0
-        fi
-        elapsed=$(( $(date +%s) - start_time ))
-        if [[ $elapsed -ge $timeout_sec ]]; then
-            error "MultiClusterObservability not Ready after ${MCO_TIMEOUT}m. Check: oc get mco observability; oc get pods -n ${OBS_NS}"
-        fi
-        printf "\r  Ready=%-6s (%dm elapsed, still installing)  " "${ready:-False}" $((elapsed / 60))
-        if (( elapsed > 0 && elapsed % 60 < 25 )); then
-            info "Still waiting for MultiClusterObservability Ready (${elapsed}s elapsed)"
-        fi
-        sleep 20
-    done
-}
-
 step_final_validation() {
-    step "12" "Installation summary"
+    step "11" "Installation summary"
 
     if [[ "$DRY_RUN" == true ]]; then
-        info "[DRY-RUN] Would print ACM/MCE/MCH/MCO status"
+        info "[DRY-RUN] Would print ACM/MCE/MCH status"
         info "Log file: ${LOG_FILE}"
         return 0
     fi
@@ -967,14 +755,9 @@ step_final_validation() {
     info "=== ManagedCluster ==="
     oc get managedcluster 2>/dev/null || true
     echo ""
-    if [[ "$SKIP_OBSERVABILITY" != true ]]; then
-        info "=== MultiClusterObservability ==="
-        oc get mco 2>/dev/null || true
-        echo ""
-    fi
     info "Log file: ${LOG_FILE}"
     echo ""
-    success "Hub install steps finished. File bugs with Affects Version ACM 5.0 and label acm-testathon."
+    success "Hub install finished. File bugs with Affects Version ACM 5.0 and label acm-testathon."
 }
 
 wait_deleted() {
@@ -1089,10 +872,6 @@ do_uninstall() {
     info "Deleting IDMS ${IDMS_NAME} (not logging-stage)"
     oc delete imagedigestmirrorset "$IDMS_NAME" --ignore-not-found || true
 
-    if [[ "$DELETE_BUCKET" == true ]]; then
-        warn "--delete-bucket requested, but bucket name is not stored in this script. Delete the acm-observe-* bucket from the cloud console if needed."
-    fi
-
     echo ""
     info "=== Post-uninstall check ==="
     oc get mch -A 2>/dev/null || true
@@ -1136,7 +915,6 @@ main() {
     info "Email: ${EMAIL}@redhat.com"
     info "MCP timeout: ${MCP_TIMEOUT} minutes"
     info "Latest FBC tags: ${USE_LATEST}"
-    info "Observability: $([[ "$SKIP_OBSERVABILITY" == true ]] && echo skipped || echo enabled)"
     info "Log file: ${LOG_FILE}"
     echo ""
 
@@ -1152,7 +930,6 @@ main() {
     step_wait_acm_operator
     step_create_mch
     step_wait_hub
-    step_install_observability
     step_final_validation
 }
 
